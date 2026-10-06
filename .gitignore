@@ -1,5 +1,7 @@
 logs
 __pycache__
+tokenizer_cache/
+.cache/
 wd14_tagger_model
 venv
 *.egg-info

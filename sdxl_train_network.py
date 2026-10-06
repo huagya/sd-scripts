@@ -1,4 +1,6 @@
 import argparse
+import os
+import re
 from typing import List, Optional, Union
 
 import torch
@@ -7,7 +9,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from library import sdxl_model_util, sdxl_train_util, strategy_base, strategy_sd, strategy_sdxl
+from library import edm_playground, sdxl_model_util, sdxl_train_util, strategy_base, strategy_sd, strategy_sdxl
 import library.args as args_util
 import library.model_io as model_io
 from library.dataset import DatasetGroup, MinimalDataset
@@ -32,7 +34,13 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group: Union[DatasetGroup, MinimalDataset],
         val_dataset_group: Optional[DatasetGroup],
     ):
-        sdxl_train_util.verify_sdxl_training_args(args)
+        sdxl_train_util.verify_sdxl_training_args(args, support_playground_v25=True)
+        if getattr(args, "playground_v25", False):
+            logger.info(
+                "Playground v2.5 LoRA: EDM sigma noise, preconditioned x0 MSE, "
+                "latent norm (z-mean)*0.5/std. Caches use %s.",
+                edm_playground.PGV25_NPZ_SUFFIX,
+            )
 
         if args.cache_text_encoder_outputs:
             assert (
@@ -48,6 +56,10 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             val_dataset_group.verify_bucket_reso_steps(32)
 
     def load_target_model(self, args, weight_dtype, accelerator):
+        # Reject an unmarked SDXL load of a Playground checkpoint before reading the weights.
+        edm_playground.raise_if_playground_checkpoint_without_flag(
+            args.pretrained_model_name_or_path, bool(getattr(args, "playground_v25", False))
+        )
         (
             load_stable_diffusion_format,
             text_encoder1,
@@ -57,7 +69,11 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             logit_scale,
             ckpt_info,
         ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
-
+        if getattr(args, "playground_v25", False):
+            mean, std, scaling = edm_playground.read_latent_stats(args.pretrained_model_name_or_path)
+            self.pg_latents_mean = mean
+            self.pg_latents_std = std
+            self.pg_scaling_factor = scaling
         self.load_stable_diffusion_format = load_stable_diffusion_format
         self.logit_scale = logit_scale
         self.ckpt_info = ckpt_info
@@ -76,6 +92,10 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         return [tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2]
 
     def get_latents_caching_strategy(self, args):
+        if getattr(args, "playground_v25", False):
+            return strategy_sd.PlaygroundV25LatentsCachingStrategy(
+                args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            )
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
             False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
         )
@@ -162,7 +182,142 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
         return noise_pred
 
+    def shift_scale_latents(self, args, latents: torch.FloatTensor) -> torch.FloatTensor:
+        if not getattr(args, "playground_v25", False):
+            return super().shift_scale_latents(args, latents)
+        return edm_playground.normalize_latents(
+            latents,
+            mean=getattr(self, "pg_latents_mean", None),
+            std=getattr(self, "pg_latents_std", None),
+            scaling_factor=getattr(self, "pg_scaling_factor", edm_playground.SCALING_FACTOR),
+        )
+
+    def get_noise_pred_and_target(
+        self,
+        args,
+        accelerator,
+        noise_scheduler,
+        latents,
+        batch,
+        text_encoder_conds,
+        unet,
+        network,
+        weight_dtype,
+        train_unet,
+        is_train=True,
+    ):
+        if not getattr(args, "playground_v25", False):
+            return super().get_noise_pred_and_target(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                batch,
+                text_encoder_conds,
+                unet,
+                network,
+                weight_dtype,
+                train_unet,
+                is_train=is_train,
+            )
+
+        # EDM: x = x0 + sigma * n, UNet sees c_in * x and c_noise, loss is unweighted MSE on x0.
+        noise = torch.randn_like(latents, dtype=torch.float32)
+        indices = torch.randint(0, edm_playground.NUM_TRAIN_TIMESTEPS, (latents.shape[0],), device="cpu")
+        noisy, scaled, c_noise, sigma = edm_playground.prepare_edm_inputs(latents, noise, indices)
+
+        if args.gradient_checkpointing:
+            scaled.requires_grad_(True)
+            for cond in text_encoder_conds:
+                if torch.is_tensor(cond):
+                    cond.requires_grad_(True)
+
+        with torch.set_grad_enabled(is_train), accelerator.autocast():
+            model_output = self.call_unet(
+                args,
+                accelerator,
+                unet,
+                scaled.to(weight_dtype).requires_grad_(train_unet),
+                c_noise,
+                text_encoder_conds,
+                batch,
+                weight_dtype,
+            )
+        pred_x0 = edm_playground.x0_target_from_model_output(noisy, model_output, sigma)
+        target = latents.float()
+
+        # Differential output preservation compares x0 to the frozen UNet's x0, not to epsilon.
+        if "custom_attributes" in batch and network is not None and hasattr(network, "set_multiplier"):
+            diff_output_pr_indices = []
+            for i, custom_attributes in enumerate(batch["custom_attributes"]):
+                if "diff_output_preservation" in custom_attributes and custom_attributes["diff_output_preservation"]:
+                    diff_output_pr_indices.append(i)
+            if len(diff_output_pr_indices) > 0:
+                network.set_multiplier(0.0)
+                with torch.no_grad(), accelerator.autocast():
+                    prior_output = self.call_unet(
+                        args,
+                        accelerator,
+                        unet,
+                        scaled.to(weight_dtype),
+                        c_noise,
+                        text_encoder_conds,
+                        batch,
+                        weight_dtype,
+                        indices=diff_output_pr_indices,
+                    )
+                network.set_multiplier(1.0)
+                prior_noisy = noisy[diff_output_pr_indices]
+                prior_sigma = sigma[diff_output_pr_indices]
+                prior_x0 = edm_playground.x0_target_from_model_output(prior_noisy, prior_output, prior_sigma)
+                target[diff_output_pr_indices] = prior_x0.to(target.dtype)
+
+        return pred_x0, target, c_noise, None
+
+    def post_process_loss(self, loss, args, timesteps, noise_scheduler):
+        if getattr(args, "playground_v25", False):
+            # Unweighted x0 MSE. Min-SNR and v-pred weightings are rejected in validate_training_args.
+            return loss
+        return super().post_process_loss(loss, args, timesteps, noise_scheduler)
+
+    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
+        super().on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=is_train)
+        if os.environ.get(edm_playground.ASSERT_ENV) != "1":
+            return
+        if not getattr(args, "playground_v25", False):
+            return
+        raw = batch.get("latents")
+        captions = batch.get("captions")
+        if raw is None or captions is None:
+            raise RuntimeError("PGV25_ASSERT_LATENT_ID: batch is missing latents or captions")
+        for i, caption in enumerate(captions):
+            match = re.match(r"id(\d+)", caption.strip())
+            if match is None:
+                raise RuntimeError(
+                    f"PGV25 pairing: caption {caption!r} does not start with the image id. "
+                    "keep_tokens/shuffle_caption dropped the id, or the caption was paired with the wrong image."
+                )
+            expected = float(int(match.group(1)))
+            got = float(raw[i, 0, 0, 0].item())
+            if abs(got - expected) > 1e-3:
+                raise RuntimeError(
+                    f"PGV25 pairing: caption {caption!r} expects latent stamp {expected}, found {got}. "
+                    "The cached latent does not belong to this caption."
+                )
+
+    def update_metadata(self, metadata, args):
+        metadata["ss_playground_v25"] = bool(getattr(args, "playground_v25", False))
+
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
+        if getattr(args, "playground_v25", False):
+            # The training loop calls this every step. Warn only when sampling was requested.
+            if getattr(args, "sample_prompts", None) and not getattr(self, "_playground_sample_warned", False):
+                logger.warning(
+                    "playground_v25: skipping sample image generation. "
+                    "The SDXL sampler is DDPM/epsilon and does not implement EDM (c_noise, c_in, sigma)."
+                )
+                self._playground_sample_warned = True
+            return
         sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
 

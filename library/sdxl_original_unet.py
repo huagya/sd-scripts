@@ -824,15 +824,29 @@ class SdxlUNet2DConditionModel(nn.Module):
     def __init__(
         self,
         in_channels: int = IN_CHANNELS,
+        model_channels: int = MODEL_CHANNELS,
+        context_dim: int = CONTEXT_DIM,
+        adm_in_channels: int = ADM_IN_CHANNELS,
+        attention_head_dim: int = 64,
+        transformer_depth_level1: int = 2,
+        transformer_depth_level2: int = 10,
         **kwargs,
     ):
         super().__init__()
 
+        # Defaults reproduce SDXL base. Smaller values exist so tests can build an
+        # SDXL-shaped UNet without allocating the 2.6B production model.
         self.in_channels = in_channels
         self.out_channels = OUT_CHANNELS
-        self.model_channels = MODEL_CHANNELS
+        self.model_channels = model_channels
+        # Timestep width stays the SDXL width. ResnetBlock2D reads TIME_EMBED_DIM,
+        # so a narrower UNet still has to feed that embedding size.
         self.time_embed_dim = TIME_EMBED_DIM
-        self.adm_in_channels = ADM_IN_CHANNELS
+        self.adm_in_channels = adm_in_channels
+        self.context_dim = context_dim
+        self.attention_head_dim = attention_head_dim
+        self.transformer_depth_level1 = transformer_depth_level1
+        self.transformer_depth_level2 = transformer_depth_level2
 
         self.gradient_checkpointing = False
         # self.sample_size = sample_size
@@ -889,12 +903,12 @@ class SdxlUNet2DConditionModel(nn.Module):
                     out_channels=2 * self.model_channels,
                 ),
                 Transformer2DModel(
-                    num_attention_heads=2 * self.model_channels // 64,
-                    attention_head_dim=64,
+                    num_attention_heads=2 * self.model_channels // self.attention_head_dim,
+                    attention_head_dim=self.attention_head_dim,
                     in_channels=2 * self.model_channels,
-                    num_transformer_layers=2,
+                    num_transformer_layers=self.transformer_depth_level1,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
+                    cross_attention_dim=self.context_dim,
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -916,12 +930,12 @@ class SdxlUNet2DConditionModel(nn.Module):
                     out_channels=4 * self.model_channels,
                 ),
                 Transformer2DModel(
-                    num_attention_heads=4 * self.model_channels // 64,
-                    attention_head_dim=64,
+                    num_attention_heads=4 * self.model_channels // self.attention_head_dim,
+                    attention_head_dim=self.attention_head_dim,
                     in_channels=4 * self.model_channels,
-                    num_transformer_layers=10,
+                    num_transformer_layers=self.transformer_depth_level2,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
+                    cross_attention_dim=self.context_dim,
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -934,12 +948,12 @@ class SdxlUNet2DConditionModel(nn.Module):
                     out_channels=4 * self.model_channels,
                 ),
                 Transformer2DModel(
-                    num_attention_heads=4 * self.model_channels // 64,
-                    attention_head_dim=64,
+                    num_attention_heads=4 * self.model_channels // self.attention_head_dim,
+                    attention_head_dim=self.attention_head_dim,
                     in_channels=4 * self.model_channels,
-                    num_transformer_layers=10,
+                    num_transformer_layers=self.transformer_depth_level2,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
+                    cross_attention_dim=self.context_dim,
                 ),
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
@@ -959,12 +973,12 @@ class SdxlUNet2DConditionModel(nn.Module):
                     out_channels=4 * self.model_channels,
                 ),
                 Transformer2DModel(
-                    num_attention_heads=4 * self.model_channels // 64,
-                    attention_head_dim=64,
+                    num_attention_heads=4 * self.model_channels // self.attention_head_dim,
+                    attention_head_dim=self.attention_head_dim,
                     in_channels=4 * self.model_channels,
-                    num_transformer_layers=10,
+                    num_transformer_layers=self.transformer_depth_level2,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
+                    cross_attention_dim=self.context_dim,
                 ),
             ]
             if i == 2:
@@ -985,12 +999,12 @@ class SdxlUNet2DConditionModel(nn.Module):
                     out_channels=2 * self.model_channels,
                 ),
                 Transformer2DModel(
-                    num_attention_heads=2 * self.model_channels // 64,
-                    attention_head_dim=64,
+                    num_attention_heads=2 * self.model_channels // self.attention_head_dim,
+                    attention_head_dim=self.attention_head_dim,
                     in_channels=2 * self.model_channels,
-                    num_transformer_layers=2,
+                    num_transformer_layers=self.transformer_depth_level1,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
+                    cross_attention_dim=self.context_dim,
                 ),
             ]
             if i == 2:

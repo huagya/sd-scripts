@@ -80,6 +80,15 @@ def _load_target_model(
     name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
     load_stable_diffusion_format = os.path.isfile(name_or_path)  # determine SD or Diffusers
 
+    from library.sdxl_tiny_checkpoint import is_tiny_sdxl_checkpoint, load_tiny_sdxl_checkpoint
+
+    if load_stable_diffusion_format and is_tiny_sdxl_checkpoint(name_or_path):
+        logger.info("load tiny SDXL-shaped test checkpoint (ss_sdxl_arch=tiny-test-v1): %s", name_or_path)
+        text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info = load_tiny_sdxl_checkpoint(
+            name_or_path, device=device, dtype=model_dtype
+        )
+        return True, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
+
     if load_stable_diffusion_format:
         logger.info(f"load StableDiffusion checkpoint: {name_or_path}")
         (
@@ -355,10 +364,32 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser, support_text_en
         action="store_true",
         help="disable mmap load for safetensors. Speed up model loading in WSL environment / safetensorsのmmapロードを無効にする。WSL環境等でモデル読み込みを高速化できる",
     )
+    parser.add_argument(
+        "--playground_v25",
+        action="store_true",
+        help="train Playground v2.5 (playgroundai/playground-v2.5-1024px-aesthetic) with EDM noise, "
+        "c_skip/c_out/c_in preconditioning and per-channel latent normalization. "
+        "Implemented for SDXL LoRA (sdxl_train_network.py). Full fine-tuning rejects this flag. "
+        "Latent caches are written to *_pgv25.npz and are not reused from SDXL *_sdxl.npz. "
+        "Sample image generation during training is disabled.",
+    )
 
 
-def verify_sdxl_training_args(args: argparse.Namespace, support_text_encoder_caching: bool = True):
+def verify_sdxl_training_args(
+    args: argparse.Namespace, support_text_encoder_caching: bool = True, support_playground_v25: bool = False
+):
     assert not args.v2, "v2 cannot be enabled in SDXL training / SDXL学習ではv2を有効にすることはできません"
+
+    if getattr(args, "playground_v25", False) and not support_playground_v25:
+        raise ValueError(
+            "--playground_v25 is only implemented for SDXL LoRA training (sdxl_train_network.py). "
+            "Full fine-tuning and other SDXL scripts still use the DDPM epsilon objective, "
+            "so this flag is rejected there instead of being ignored."
+        )
+    if getattr(args, "playground_v25", False):
+        from library.edm_playground import validate_training_args
+
+        validate_training_args(args)
 
     if args.clip_skip is not None:
         logger.warning("clip_skip will be unexpected / SDXL学習ではclip_skipは動作しません")

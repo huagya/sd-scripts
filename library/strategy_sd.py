@@ -188,3 +188,94 @@ class SdSdxlLatentsCachingStrategy(LatentsCachingStrategy):
 
         if not accelerator_setup.HIGH_VRAM:
             device_utils.clean_memory_on_device(vae.device)
+
+
+class PlaygroundV25LatentsCachingStrategy(SdSdxlLatentsCachingStrategy):
+    """Raw VAE latents for Playground v2.5, in ``*_pgv25.npz`` files.
+
+    Normalization ``(z - mean) * 0.5 / std`` is applied at train time, not in
+    the cache. The file records ``latent_format=playground_v25_raw`` and the
+    source image stem. SDXL ``*_sdxl.npz`` / legacy ``.npz`` files are never
+    selected, and a mismatched Playground file raises instead of being reused.
+    """
+
+    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
+        super().__init__(False, cache_to_disk, batch_size, skip_disk_cache_validity_check)
+        from library.edm_playground import PGV25_NPZ_SUFFIX
+
+        self.suffix = PGV25_NPZ_SUFFIX
+        self._stamp_by_npz: Optional[dict] = None
+
+    def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
+        # Do not fall back to legacy .npz or *_sdxl.npz. Those are a different normalization.
+        return os.path.splitext(absolute_path)[0] + f"_{image_size[0]:04d}x{image_size[1]:04d}" + self.suffix
+
+    def _assert_cache_file(self, npz_path: str) -> None:
+        from library.edm_playground import assert_playground_latent_npz
+
+        if not os.path.exists(npz_path):
+            return
+        with np.load(npz_path) as npz:
+            assert_playground_latent_npz(npz_path, npz)
+
+    def is_disk_cached_latents_expected(self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool):
+        # Format/source checks are never skipped, including with --skip_cache_check.
+        self._assert_cache_file(npz_path)
+        return self._default_is_disk_cached_latents_expected(8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True)
+
+    def load_latents_from_disk(
+        self, npz_path: str, bucket_reso: Tuple[int, int]
+    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+        self._assert_cache_file(npz_path)
+        return self._default_load_latents_from_disk(8, npz_path, bucket_reso)
+
+    def cache_batch_latents(self, vae, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool):
+        from library.edm_playground import STAMP_ENV
+
+        self._stamp_by_npz = {}
+        if os.environ.get(STAMP_ENV) == "1":
+            from PIL import Image
+
+            for info in image_infos:
+                with Image.open(info.absolute_path) as image:
+                    rgb = np.array(image.convert("RGB"), dtype=np.float32)
+                # Solid-color test images keep this mean through bucket crops.
+                self._stamp_by_npz[info.latents_npz] = float(rgb[:, :, 0].mean())
+        try:
+            super().cache_batch_latents(vae, image_infos, flip_aug, alpha_mask, random_crop)
+        finally:
+            self._stamp_by_npz = None
+
+    def save_latents_to_disk(
+        self,
+        npz_path,
+        latents_tensor,
+        original_size,
+        crop_ltrb,
+        flipped_latents_tensor=None,
+        alpha_mask=None,
+        key_reso_suffix="",
+    ):
+        from library.edm_playground import LATENT_FORMAT_KEY, LATENT_FORMAT_VALUE, LATENT_SOURCE_KEY, npz_source_basename
+
+        if self._stamp_by_npz and npz_path in self._stamp_by_npz:
+            stamp = self._stamp_by_npz[npz_path]
+            latents_tensor = latents_tensor.clone()
+            latents_tensor[0, 0, 0] = stamp
+            if flipped_latents_tensor is not None:
+                flipped_latents_tensor = flipped_latents_tensor.clone()
+                flipped_latents_tensor[0, 0, 0] = stamp
+        super().save_latents_to_disk(
+            npz_path,
+            latents_tensor,
+            original_size,
+            crop_ltrb,
+            flipped_latents_tensor,
+            alpha_mask,
+            key_reso_suffix,
+        )
+        with np.load(npz_path) as npz:
+            kwargs = {key: npz[key] for key in npz.files}
+        kwargs[LATENT_FORMAT_KEY] = np.array(LATENT_FORMAT_VALUE)
+        kwargs[LATENT_SOURCE_KEY] = np.array(npz_source_basename(npz_path))
+        np.savez(npz_path, **kwargs)

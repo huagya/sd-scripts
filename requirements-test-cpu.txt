@@ -1,0 +1,17 @@
+# CPU test dependencies for Playground v2.5 LoRA tests.
+# Torch and torchvision are installed from the CPU wheel index by
+# tools/setup_cpu_test_env.sh so this file stays free of an index URL.
+diffusers==0.40.0
+transformers==5.17.0
+accelerate==1.15.0
+safetensors==0.8.0
+einops==0.7.0
+ftfy==6.3.1
+toml==0.10.2
+voluptuous==0.15.2
+huggingface-hub==1.32.0
+imagesize==1.4.1
+numpy
+pillow
+pytest>=6.0
+rich==14.1.0
