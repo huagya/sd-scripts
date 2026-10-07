@@ -319,3 +319,23 @@ For other detailed options, please refer to the script's help (`python sdxl_trai
 
 その他の詳細なオプションについては、スクリプトのヘルプ (`python sdxl_train_network.py --help`) やリポジトリ内の他のドキュメントを参照してください。
 </details>
+
+## 6. Playground v2.5 LoRA / Playground v2.5 の LoRA
+
+Playground v2.5 (`playgroundai/playground-v2.5-1024px-aesthetic`) has an SDXL UNet, but it was trained with EDM rather than SDXL's DDPM epsilon objective. Pass `--playground_v25` so LoRA training uses sigma noise, `c_skip` / `c_out` / `c_in` / `c_noise`, unweighted x0 MSE, and latent normalization `(z - latents_mean) * 0.5 / latents_std`.
+
+Without the flag, a checkpoint that contains `edm_mean` / `edm_std` (or a Diffusers folder whose scheduler class name contains `EDM`) is rejected. Loading it as plain SDXL would train the wrong objective with no error from the UNet.
+
+Loading:
+
+* **Single-file safetensors** in the SDXL checkpoint layout (`model.diffusion_model`, `conditioner.embedders`, `first_stage_model`). The official fp32 file is this layout and also stores `edm_mean` / `edm_std`. Those two tensors are read as the latent stats and are not part of the UNet.
+* **Diffusers directory** (or a Hugging Face model id) through the existing SDXL Diffusers loader. `vae/config.json` must contain `latents_mean` and `latents_std`.
+
+Latent caches are `*_pgv25.npz` and are not read from `*_sdxl.npz` or legacy `.npz`. An incomplete cache is recomputed. Do not pass `--vae`. DDPM options (`--v_parameterization`, `--min_snr_gamma`, `--noise_offset`, `--zero_terminal_snr`, `--ip_noise_gamma`, timestep limits, non-L2 losses) raise. `--pgv25_sigma_sampling` is `karras_uniform` (default, the diffusers reference) or `lognormal`. `--pgv25_loss_weighting` is `none` (default) or `edm` (F-space λ). Validation uses those pinned integers as fixed Karras indices. Sample images during training are skipped: the built-in sampler is DDPM. The LoRA file itself is ordinary kohya LoRA. `sdxl_train.py` (full fine-tune) rejects the flag. See `HANDOFF.md` for a 16GB starting command and what is still unverified.
+
+<details>
+<summary>日本語</summary>
+
+Playground v2.5 は SDXL と同じ UNet ですが、学習は DDPM ではなく EDM です。`--playground_v25` を付けると、σ ノイズ、preconditioning、x0 MSE、潜在の `(z - mean) * 0.5 / std` を使います。既定は diffusers と同じ一様 Karras と重みなし MSE です。`--pgv25_sigma_sampling=lognormal` と `--pgv25_loss_weighting=edm` は別の選択肢です。フラグなしで `edm_mean` / `edm_std` 付きのモデルを読むとエラーになります。キャッシュは `*_pgv25.npz` で、壊れたファイルは作り直します。学習中のサンプル画像は出しません。検証損失は固定した Karras の σ です。LoRA の保存形式は通常の kohya LoRA です。詳細と 16GB 向けの出発点は `HANDOFF.md` と `ROADMAP.md` を参照してください。
+
+</details>

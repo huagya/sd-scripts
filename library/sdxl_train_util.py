@@ -80,6 +80,15 @@ def _load_target_model(
     name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
     load_stable_diffusion_format = os.path.isfile(name_or_path)  # determine SD or Diffusers
 
+    from library.sdxl_tiny_checkpoint import is_tiny_sdxl_checkpoint, load_tiny_sdxl_checkpoint
+
+    if load_stable_diffusion_format and is_tiny_sdxl_checkpoint(name_or_path):
+        logger.info("load tiny SDXL-shaped test checkpoint (ss_sdxl_arch=tiny-test-v1): %s", name_or_path)
+        text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info = load_tiny_sdxl_checkpoint(
+            name_or_path, device=device, dtype=model_dtype
+        )
+        return True, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
+
     if load_stable_diffusion_format:
         logger.info(f"load StableDiffusion checkpoint: {name_or_path}")
         (
@@ -355,10 +364,88 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser, support_text_en
         action="store_true",
         help="disable mmap load for safetensors. Speed up model loading in WSL environment / safetensorsのmmapロードを無効にする。WSL環境等でモデル読み込みを高速化できる",
     )
+    parser.add_argument(
+        "--playground_v25",
+        action="store_true",
+        help="train Playground v2.5 (playgroundai/playground-v2.5-1024px-aesthetic) with EDM noise, "
+        "c_skip/c_out/c_in preconditioning and per-channel latent normalization. "
+        "Implemented for SDXL LoRA (sdxl_train_network.py). Full fine-tuning rejects this flag. "
+        "Latent caches are written to *_pgv25.npz and are not reused from SDXL *_sdxl.npz. "
+        "Sample image generation during training is disabled. "
+        "Validation uses a fixed Karras sigma index (the same integers the SDXL loop pins).",
+    )
+    parser.add_argument(
+        "--pgv25_sigma_sampling",
+        type=str,
+        default="karras_uniform",
+        choices=["karras_uniform", "lognormal"],
+        help="Playground v2.5 sigma sampling. karras_uniform (default) draws an index on the "
+        "EDMEulerScheduler Karras grid, matching the diffusers SDXL EDM training script. "
+        "lognormal draws ln(sigma) ~ Normal(--pgv25_sigma_mean, --pgv25_sigma_std). "
+        "Requires --playground_v25. The default may change after a real-GPU A/B.",
+    )
+    parser.add_argument(
+        "--pgv25_sigma_mean",
+        type=float,
+        default=-1.2,
+        help="P_mean for --pgv25_sigma_sampling=lognormal. EDM paper default -1.2. Ignored for karras_uniform.",
+    )
+    parser.add_argument(
+        "--pgv25_sigma_std",
+        type=float,
+        default=1.2,
+        help="P_std for --pgv25_sigma_sampling=lognormal. EDM paper default 1.2. Ignored for karras_uniform.",
+    )
+    parser.add_argument(
+        "--pgv25_loss_weighting",
+        type=str,
+        default="none",
+        choices=["none", "edm"],
+        help="Playground v2.5 loss weight. none (default) is unweighted x0 MSE, matching the diffusers "
+        "reference. edm multiplies by lambda(sigma)=(sigma^2+sigma_data^2)/(sigma*sigma_data)^2, "
+        "which is the F-space loss. Requires --playground_v25.",
+    )
+    parser.add_argument(
+        "--pgv25_cache_fp16",
+        action="store_true",
+        help="store Playground raw VAE latents as fp16 in *_pgv25.npz (about half the disk of fp32). "
+        "Train-time normalization is still fp32. Off by default. Requires --playground_v25.",
+    )
 
 
-def verify_sdxl_training_args(args: argparse.Namespace, support_text_encoder_caching: bool = True):
+def verify_sdxl_training_args(
+    args: argparse.Namespace, support_text_encoder_caching: bool = True, support_playground_v25: bool = False
+):
     assert not args.v2, "v2 cannot be enabled in SDXL training / SDXL学習ではv2を有効にすることはできません"
+
+    sampling = getattr(args, "pgv25_sigma_sampling", "karras_uniform")
+    weighting = getattr(args, "pgv25_loss_weighting", "none")
+    sigma_mean = getattr(args, "pgv25_sigma_mean", -1.2)
+    sigma_std = getattr(args, "pgv25_sigma_std", 1.2)
+    cache_fp16 = bool(getattr(args, "pgv25_cache_fp16", False))
+    pg_options_changed = (
+        sampling not in (None, "karras_uniform")
+        or weighting not in (None, "none")
+        or (sigma_mean is not None and float(sigma_mean) != -1.2)
+        or (sigma_std is not None and float(sigma_std) != 1.2)
+        or cache_fp16
+    )
+    if pg_options_changed and not getattr(args, "playground_v25", False):
+        raise ValueError(
+            "--pgv25_sigma_sampling, --pgv25_sigma_mean, --pgv25_sigma_std, --pgv25_loss_weighting, "
+            "and --pgv25_cache_fp16 require --playground_v25."
+        )
+
+    if getattr(args, "playground_v25", False) and not support_playground_v25:
+        raise ValueError(
+            "--playground_v25 is only implemented for SDXL LoRA training (sdxl_train_network.py). "
+            "Full fine-tuning and other SDXL scripts still use the DDPM epsilon objective, "
+            "so this flag is rejected there instead of being ignored."
+        )
+    if getattr(args, "playground_v25", False):
+        from library.edm_playground import validate_training_args
+
+        validate_training_args(args)
 
     if args.clip_skip is not None:
         logger.warning("clip_skip will be unexpected / SDXL学習ではclip_skipは動作しません")
