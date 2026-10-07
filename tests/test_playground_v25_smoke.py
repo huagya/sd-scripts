@@ -72,7 +72,7 @@ def tiny_checkpoint(tmp_path_factory):
     return str(path)
 
 
-def _train_args(checkpoint, data_dir, out_dir, name, steps, playground: bool):
+def _train_args(checkpoint, data_dir, out_dir, name, steps, playground: bool, extra=None):
     cmd = [
         sys.executable,
         "sdxl_train_network.py",
@@ -109,6 +109,8 @@ def _train_args(checkpoint, data_dir, out_dir, name, steps, playground: bool):
     ]
     if playground:
         cmd.append("--playground_v25")
+    if extra:
+        cmd.extend(extra)
     return cmd
 
 
@@ -129,6 +131,8 @@ def test_playground_v25_lora_smoke(tiny_checkpoint, tmp_path):
         metadata = handle.metadata() or {}
         keys = list(handle.keys())
     assert metadata.get("ss_playground_v25") == "True"
+    assert metadata.get("ss_pgv25_sigma_sampling") == "karras_uniform"
+    assert metadata.get("ss_pgv25_loss_weighting") == "none"
     assert metadata.get("ss_network_module") == "networks.lora"
     assert metadata.get("ss_max_token_length") == "225"
     assert any(key.startswith("lora_unet_") for key in keys)
@@ -157,6 +161,8 @@ def test_playground_v25_lora_smoke(tiny_checkpoint, tmp_path):
         with np.load(matches[0]) as npz:
             assert_playground_latent_npz(matches[0], npz)
             assert str(npz["latent_format"].item()) == LATENT_FORMAT_VALUE
+            assert "source_size" in npz.files
+            assert "source_mtime_ns" in npz.files
             # The training process already asserted caption/latent stamps. Check the file too.
             latent_key = [key for key in npz.files if key.startswith("latents_")][0]
             assert float(npz[latent_key][0, 0, 0]) == pytest.approx(red)
@@ -179,6 +185,46 @@ def test_playground_v25_lora_smoke(tiny_checkpoint, tmp_path):
     assert len(weights) == len(keys)
     # Applying the LoRA must run without a shape error. Weights are random and tiny.
     network.merge_to([te1, te2], unet, weights, torch.float32, torch.device("cpu"))
+
+
+def _assert_short_playground_run(tiny_checkpoint, tmp_path, extra, name, expect_sampling, expect_weighting):
+    data = tmp_path / "data"
+    out = tmp_path / "out"
+    _write_dataset(str(data), 2)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    log_path = str(tmp_path / f"{name}.log")
+    cmd = _train_args(tiny_checkpoint, str(data), str(out), name, 2, True, extra=extra)
+    _run(cmd, env, log_path)
+    lora_path = out / f"{name}.safetensors"
+    assert lora_path.is_file(), f"LoRA was not saved. See {log_path}"
+    with safe_open(str(lora_path), framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+    assert metadata.get("ss_playground_v25") == "True"
+    assert metadata.get("ss_pgv25_sigma_sampling") == expect_sampling
+    assert metadata.get("ss_pgv25_loss_weighting") == expect_weighting
+
+
+def test_playground_v25_lognormal_smoke(tiny_checkpoint, tmp_path):
+    _assert_short_playground_run(
+        tiny_checkpoint,
+        tmp_path,
+        ["--pgv25_sigma_sampling=lognormal", "--pgv25_sigma_mean=-1.2", "--pgv25_sigma_std=1.2"],
+        "pg_lognormal",
+        "lognormal",
+        "none",
+    )
+
+
+def test_playground_v25_edm_weight_smoke(tiny_checkpoint, tmp_path):
+    _assert_short_playground_run(
+        tiny_checkpoint,
+        tmp_path,
+        ["--pgv25_loss_weighting=edm"],
+        "pg_edm_weight",
+        "karras_uniform",
+        "edm",
+    )
 
 
 def test_plain_sdxl_lora_smoke_unchanged(tiny_checkpoint, tmp_path):

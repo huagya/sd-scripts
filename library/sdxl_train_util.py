@@ -371,7 +371,45 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser, support_text_en
         "c_skip/c_out/c_in preconditioning and per-channel latent normalization. "
         "Implemented for SDXL LoRA (sdxl_train_network.py). Full fine-tuning rejects this flag. "
         "Latent caches are written to *_pgv25.npz and are not reused from SDXL *_sdxl.npz. "
-        "Sample image generation during training is disabled.",
+        "Sample image generation during training is disabled. "
+        "Validation uses a fixed Karras sigma index (the same integers the SDXL loop pins).",
+    )
+    parser.add_argument(
+        "--pgv25_sigma_sampling",
+        type=str,
+        default="karras_uniform",
+        choices=["karras_uniform", "lognormal"],
+        help="Playground v2.5 sigma sampling. karras_uniform (default) draws an index on the "
+        "EDMEulerScheduler Karras grid, matching the diffusers SDXL EDM training script. "
+        "lognormal draws ln(sigma) ~ Normal(--pgv25_sigma_mean, --pgv25_sigma_std). "
+        "Requires --playground_v25. The default may change after a real-GPU A/B.",
+    )
+    parser.add_argument(
+        "--pgv25_sigma_mean",
+        type=float,
+        default=-1.2,
+        help="P_mean for --pgv25_sigma_sampling=lognormal. EDM paper default -1.2. Ignored for karras_uniform.",
+    )
+    parser.add_argument(
+        "--pgv25_sigma_std",
+        type=float,
+        default=1.2,
+        help="P_std for --pgv25_sigma_sampling=lognormal. EDM paper default 1.2. Ignored for karras_uniform.",
+    )
+    parser.add_argument(
+        "--pgv25_loss_weighting",
+        type=str,
+        default="none",
+        choices=["none", "edm"],
+        help="Playground v2.5 loss weight. none (default) is unweighted x0 MSE, matching the diffusers "
+        "reference. edm multiplies by lambda(sigma)=(sigma^2+sigma_data^2)/(sigma*sigma_data)^2, "
+        "which is the F-space loss. Requires --playground_v25.",
+    )
+    parser.add_argument(
+        "--pgv25_cache_fp16",
+        action="store_true",
+        help="store Playground raw VAE latents as fp16 in *_pgv25.npz (about half the disk of fp32). "
+        "Train-time normalization is still fp32. Off by default. Requires --playground_v25.",
     )
 
 
@@ -379,6 +417,24 @@ def verify_sdxl_training_args(
     args: argparse.Namespace, support_text_encoder_caching: bool = True, support_playground_v25: bool = False
 ):
     assert not args.v2, "v2 cannot be enabled in SDXL training / SDXL学習ではv2を有効にすることはできません"
+
+    sampling = getattr(args, "pgv25_sigma_sampling", "karras_uniform")
+    weighting = getattr(args, "pgv25_loss_weighting", "none")
+    sigma_mean = getattr(args, "pgv25_sigma_mean", -1.2)
+    sigma_std = getattr(args, "pgv25_sigma_std", 1.2)
+    cache_fp16 = bool(getattr(args, "pgv25_cache_fp16", False))
+    pg_options_changed = (
+        sampling not in (None, "karras_uniform")
+        or weighting not in (None, "none")
+        or (sigma_mean is not None and float(sigma_mean) != -1.2)
+        or (sigma_std is not None and float(sigma_std) != 1.2)
+        or cache_fp16
+    )
+    if pg_options_changed and not getattr(args, "playground_v25", False):
+        raise ValueError(
+            "--pgv25_sigma_sampling, --pgv25_sigma_mean, --pgv25_sigma_std, --pgv25_loss_weighting, "
+            "and --pgv25_cache_fp16 require --playground_v25."
+        )
 
     if getattr(args, "playground_v25", False) and not support_playground_v25:
         raise ValueError(

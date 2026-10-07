@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 
 from library.utils import setup_logging
@@ -42,7 +44,18 @@ LATENTS_STD = (8.4927, 5.9022, 6.5498, 5.2299)
 LATENT_FORMAT_KEY = "latent_format"
 LATENT_FORMAT_VALUE = "playground_v25_raw"
 LATENT_SOURCE_KEY = "source_basename"
+# Cheap replacement check. A same-size, same-mtime overwrite is not detected.
+LATENT_SOURCE_SIZE_KEY = "source_size"
+LATENT_SOURCE_MTIME_NS_KEY = "source_mtime_ns"
 PGV25_NPZ_SUFFIX = "_pgv25.npz"
+
+SIGMA_SAMPLING_KARRAS = "karras_uniform"
+SIGMA_SAMPLING_LOGNORMAL = "lognormal"
+LOSS_WEIGHTING_NONE = "none"
+LOSS_WEIGHTING_EDM = "edm"
+# EDM paper (Karras et al.) defaults. Used only when sampling is lognormal.
+DEFAULT_P_MEAN = -1.2
+DEFAULT_P_STD = 1.2
 
 # Test-only hooks. Production training leaves these unset.
 STAMP_ENV = "PGV25_STAMP_LATENT_ID"
@@ -168,13 +181,83 @@ def prepare_edm_inputs(
 
     ``latents`` must already be Playground-normalized. ``sigma`` has shape
     ``(batch,)``; callers broadcast it inside ``add_edm_noise`` /
-    ``precondition_*``.
+    ``precondition_*``. ``c_noise`` is ``0.25 * ln(sigma)`` from the discrete
+    Karras grid (the same values ``EDMEulerScheduler.timesteps`` stores).
     """
     schedule = schedule or get_schedule()
     c_noise_t, sigma = schedule.gather(indices, latents.device)
     noisy = add_edm_noise(latents, noise, sigma)
     scaled = precondition_inputs(noisy, sigma, schedule.sigma_data)
     return noisy, scaled, c_noise_t, sigma
+
+
+def sample_lognormal_sigma(
+    batch_size: int,
+    p_mean: float = DEFAULT_P_MEAN,
+    p_std: float = DEFAULT_P_STD,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Draw σ with ``ln(σ) ~ Normal(P_mean, P_std)`` (EDM paper, not the Karras grid)."""
+    if p_std <= 0:
+        raise ValueError(f"pgv25_sigma_std must be positive, got {p_std}")
+    log_sigma = torch.randn(batch_size, device=device, dtype=torch.float32) * float(p_std) + float(p_mean)
+    return torch.exp(log_sigma)
+
+
+def prepare_edm_inputs_from_sigma(
+    latents: torch.Tensor, noise: torch.Tensor, sigma: torch.Tensor, sigma_data: float = SIGMA_DATA
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same tensors as ``prepare_edm_inputs``, for a continuous σ.
+
+    ``c_noise`` is ``0.25 * ln(sigma)`` of the given σ, not a lookup on the
+    1000-bin Karras grid.
+    """
+    sigma = sigma.to(device=latents.device, dtype=torch.float32).reshape(-1)
+    if sigma.shape[0] != latents.shape[0]:
+        raise ValueError(f"sigma batch {sigma.shape[0]} does not match latents {latents.shape[0]}")
+    if torch.any(sigma <= 0):
+        raise ValueError("EDM sigma must be positive")
+    c_noise_t = c_noise(sigma).to(dtype=torch.float32)
+    noisy = add_edm_noise(latents, noise, sigma)
+    scaled = precondition_inputs(noisy, sigma, sigma_data)
+    return noisy, scaled, c_noise_t, sigma
+
+
+def edm_loss_weight(sigma: torch.Tensor, sigma_data: float = SIGMA_DATA) -> torch.Tensor:
+    """``λ(σ) = (σ² + σ_data²) / (σ · σ_data)²``, which equals ``1 / c_out²``.
+
+    Multiplying x0 MSE by λ is the EDM F-space MSE. It is not the ``σ^-2``
+    weight that the diffusers script uses for non-EDM schedulers.
+    """
+    sigma = sigma.to(dtype=torch.float32).reshape(-1)
+    return (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2
+
+
+def pinned_validation_index(min_timestep, max_timestep) -> Optional[int]:
+    """Karras-grid index when validation has pinned ``min_timestep == max_timestep``.
+
+    ``train_network.py`` sets both to the same integer for each validation
+    pass (by default 200, 400, 600, 800). Those integers are DDPM timesteps
+    in SDXL mode. In Playground mode they are indices into the training
+    Karras grid ``[0, 1000)``, so the validation loss uses a fixed σ instead
+    of a fresh random draw. Out-of-range values are clamped.
+    """
+    if min_timestep is None or max_timestep is None:
+        return None
+    if int(min_timestep) != int(max_timestep):
+        return None
+    index = int(min_timestep)
+    if index < 0 or index >= NUM_TRAIN_TIMESTEPS:
+        clamped = min(max(index, 0), NUM_TRAIN_TIMESTEPS - 1)
+        logger.warning(
+            "playground_v25: validation timestep %s is outside the Karras training range "
+            "[0, %s). Using index %s.",
+            index,
+            NUM_TRAIN_TIMESTEPS,
+            clamped,
+        )
+        return clamped
+    return index
 
 
 def x0_target_from_model_output(
@@ -249,7 +332,21 @@ def validate_training_args(args) -> None:
     reject(getattr(args, "min_timestep", None) is not None, "--min_timestep", "selects a DDPM timestep range; EDM samples the Karras sigma grid")
     reject(getattr(args, "max_timestep", None) is not None, "--max_timestep", "selects a DDPM timestep range; EDM samples the Karras sigma grid")
     loss_type = getattr(args, "loss_type", "l2") or "l2"
-    reject(loss_type != "l2", f"--loss_type={loss_type}", "Playground v2.5 EDM training uses unweighted MSE on the preconditioned x0 prediction")
+    reject(loss_type != "l2", f"--loss_type={loss_type}", "Playground v2.5 EDM training uses MSE on the preconditioned x0 prediction")
+    sampling = getattr(args, "pgv25_sigma_sampling", SIGMA_SAMPLING_KARRAS) or SIGMA_SAMPLING_KARRAS
+    weighting = getattr(args, "pgv25_loss_weighting", LOSS_WEIGHTING_NONE) or LOSS_WEIGHTING_NONE
+    reject(
+        sampling not in (SIGMA_SAMPLING_KARRAS, SIGMA_SAMPLING_LOGNORMAL),
+        f"--pgv25_sigma_sampling={sampling}",
+        f"expected {SIGMA_SAMPLING_KARRAS} or {SIGMA_SAMPLING_LOGNORMAL}",
+    )
+    reject(
+        weighting not in (LOSS_WEIGHTING_NONE, LOSS_WEIGHTING_EDM),
+        f"--pgv25_loss_weighting={weighting}",
+        f"expected {LOSS_WEIGHTING_NONE} or {LOSS_WEIGHTING_EDM}",
+    )
+    sigma_std = float(getattr(args, "pgv25_sigma_std", DEFAULT_P_STD))
+    reject(sigma_std <= 0, f"--pgv25_sigma_std={sigma_std}", "must be positive")
     reject(bool(getattr(args, "train_inpainting", False)), "--train_inpainting", "inpainting channel concat is not defined for Playground v2.5 EDM training")
     reject(getattr(args, "vae", None) not in (None, ""), "--vae", "a replacement VAE would not match Playground's latents_mean/latents_std; refusing to train with a mismatched latent normalization")
 
@@ -264,7 +361,9 @@ def validate_training_args(args) -> None:
         args.no_half_vae = True
         logger.warning(
             "playground_v25: forcing --no_half_vae so the VAE encode stays fp32. "
-            "Playground latent magnitudes overflow a fp16 VAE."
+            "The Playground VAE config sets force_upcast, and diffusers PR #7126 keeps the "
+            "encode in fp32. Raw latent magnitudes are similar to SDXL (std about 6-8); "
+            "fp32 is the upcast, not a claim that these latents uniquely overflow fp16."
         )
 
     if getattr(args, "sample_prompts", None) or getattr(args, "sample_every_n_steps", None) or getattr(
@@ -469,5 +568,100 @@ def assert_playground_latent_npz(npz_path: str, npz) -> None:
     if source_s != expected:
         raise ValueError(
             f"Latent cache {npz_path} was written for image '{source_s}' but the filename belongs to '{expected}'. "
-            "Refusing to train with a copied or mismatched latent cache."
+            "Delete this file to rebuild it."
         )
+
+
+def image_file_stat(path: str) -> Tuple[int, int]:
+    st = os.stat(path)
+    return int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+
+
+def atomic_savez(path: str, **arrays) -> None:
+    """Write an npz via a temp file in the same directory, then ``os.replace``.
+
+    A crash mid-write leaves the previous file (or no file), not a half-written
+    cache that the next launch would treat as valid. ``os.replace`` is atomic
+    on the same volume on Windows and POSIX.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".pgv25-cache-", suffix=".npz", dir=directory)
+    os.close(fd)
+    try:
+        # numpy appends .npz when the name does not already end with it.
+        np.savez(tmp_path, **arrays)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def classify_playground_cache(npz_path: str, npz, image_path: Optional[str] = None) -> str:
+    """Return ``ok`` or ``recompute``. Raise one line for a foreign or copied cache.
+
+    Incomplete files (unreadable, no marker, missing source) are ``recompute``.
+    A present but wrong ``latent_format``, or a source stem that does not match
+    the filename, raises ``ValueError`` naming the file and telling the user to
+    delete it. A size/mtime mismatch with the image is ``recompute``.
+    """
+    if LATENT_FORMAT_KEY not in getattr(npz, "files", []):
+        logger.warning(
+            "playground_v25: %s has no %s marker (incomplete write or a foreign npz). It will be recomputed.",
+            npz_path,
+            LATENT_FORMAT_KEY,
+        )
+        return "recompute"
+    stored = npz[LATENT_FORMAT_KEY]
+    stored_s = stored.item() if getattr(stored, "shape", ()) == () else str(stored)
+    if isinstance(stored_s, bytes):
+        stored_s = stored_s.decode("utf-8")
+    stored_s = str(stored_s)
+    if stored_s != LATENT_FORMAT_VALUE:
+        raise ValueError(
+            f"Latent cache {npz_path} has {LATENT_FORMAT_KEY}={stored_s!r}, expected {LATENT_FORMAT_VALUE!r}. "
+            "Delete this file to rebuild it."
+        )
+    if LATENT_SOURCE_KEY not in npz.files:
+        logger.warning(
+            "playground_v25: %s is missing %s. It will be recomputed.",
+            npz_path,
+            LATENT_SOURCE_KEY,
+        )
+        return "recompute"
+    source = npz[LATENT_SOURCE_KEY]
+    source_s = source.item() if getattr(source, "shape", ()) == () else str(source)
+    if isinstance(source_s, bytes):
+        source_s = source_s.decode("utf-8")
+    if str(source_s) != npz_source_basename(npz_path):
+        raise ValueError(
+            f"Latent cache {npz_path} was written for image '{source_s}' but the filename belongs to "
+            f"'{npz_source_basename(npz_path)}'. Delete this file to rebuild it."
+        )
+    if image_path and LATENT_SOURCE_SIZE_KEY in npz.files and LATENT_SOURCE_MTIME_NS_KEY in npz.files:
+        if not os.path.isfile(image_path):
+            logger.warning(
+                "playground_v25: %s records source %s but that image is missing. It will be recomputed.",
+                npz_path,
+                image_path,
+            )
+            return "recompute"
+        size, mtime_ns = image_file_stat(image_path)
+        stored_size = int(np.array(npz[LATENT_SOURCE_SIZE_KEY]).reshape(-1)[0])
+        stored_mtime = int(np.array(npz[LATENT_SOURCE_MTIME_NS_KEY]).reshape(-1)[0])
+        if stored_size != size or stored_mtime != mtime_ns:
+            logger.warning(
+                "playground_v25: %s does not match %s (cache size=%s mtime_ns=%s, file size=%s mtime_ns=%s). "
+                "It will be recomputed.",
+                npz_path,
+                image_path,
+                stored_size,
+                stored_mtime,
+                size,
+                mtime_ns,
+            )
+            return "recompute"
+    return "ok"

@@ -93,9 +93,11 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
 
     def get_latents_caching_strategy(self, args):
         if getattr(args, "playground_v25", False):
-            return strategy_sd.PlaygroundV25LatentsCachingStrategy(
+            latents_caching_strategy = strategy_sd.PlaygroundV25LatentsCachingStrategy(
                 args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
             )
+            latents_caching_strategy.cache_fp16 = bool(getattr(args, "pgv25_cache_fp16", False))
+            return latents_caching_strategy
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
             False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
         )
@@ -221,15 +223,44 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 is_train=is_train,
             )
 
-        # EDM: x = x0 + sigma * n, UNet sees c_in * x and c_noise, loss is unweighted MSE on x0.
+        # EDM: x = x0 + sigma * n, UNet sees c_in * x and c_noise.
+        # Default sampling is the diffusers Karras grid (uniform index). Lognormal
+        # draws a continuous sigma. Validation pins min_timestep == max_timestep
+        # and that integer is a Karras index, so the sigma is not random.
         noise = torch.randn_like(latents, dtype=torch.float32)
-        indices = torch.randint(0, edm_playground.NUM_TRAIN_TIMESTEPS, (latents.shape[0],), device="cpu")
-        noisy, scaled, c_noise, sigma = edm_playground.prepare_edm_inputs(latents, noise, indices)
+        pinned = None if is_train else edm_playground.pinned_validation_index(
+            getattr(args, "min_timestep", None), getattr(args, "max_timestep", None)
+        )
+        sampling = getattr(args, "pgv25_sigma_sampling", edm_playground.SIGMA_SAMPLING_KARRAS) or edm_playground.SIGMA_SAMPLING_KARRAS
+        if pinned is not None or sampling == edm_playground.SIGMA_SAMPLING_KARRAS:
+            if pinned is not None:
+                indices = torch.full((latents.shape[0],), pinned, dtype=torch.long)
+            else:
+                indices = torch.randint(0, edm_playground.NUM_TRAIN_TIMESTEPS, (latents.shape[0],), device="cpu")
+            noisy, scaled, c_noise, sigma = edm_playground.prepare_edm_inputs(latents, noise, indices)
+        elif sampling == edm_playground.SIGMA_SAMPLING_LOGNORMAL:
+            sigma = edm_playground.sample_lognormal_sigma(
+                latents.shape[0],
+                p_mean=float(getattr(args, "pgv25_sigma_mean", edm_playground.DEFAULT_P_MEAN)),
+                p_std=float(getattr(args, "pgv25_sigma_std", edm_playground.DEFAULT_P_STD)),
+            )
+            noisy, scaled, c_noise, sigma = edm_playground.prepare_edm_inputs_from_sigma(latents, noise, sigma)
+        else:
+            raise ValueError(
+                f"--pgv25_sigma_sampling={sampling} is not supported. "
+                f"Use {edm_playground.SIGMA_SAMPLING_KARRAS} or {edm_playground.SIGMA_SAMPLING_LOGNORMAL}."
+            )
 
-        if args.gradient_checkpointing:
-            scaled.requires_grad_(True)
+        # Cast to the UNet dtype before requires_grad_. Doing requires_grad_(True)
+        # on the fp32 tensor and then .to(bf16).requires_grad_(...) raises on the
+        # non-leaf cast when gradient checkpointing is on, which is the
+        # text-encoder-only + bf16 path (train_unet is False).
+        model_input = scaled.detach().to(weight_dtype)
+        if is_train and args.gradient_checkpointing and train_unet:
+            model_input.requires_grad_(True)
+        if is_train and args.gradient_checkpointing:
             for cond in text_encoder_conds:
-                if torch.is_tensor(cond):
+                if torch.is_tensor(cond) and cond.is_floating_point() and cond.is_leaf:
                     cond.requires_grad_(True)
 
         with torch.set_grad_enabled(is_train), accelerator.autocast():
@@ -237,7 +268,7 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 args,
                 accelerator,
                 unet,
-                scaled.to(weight_dtype).requires_grad_(train_unet),
+                model_input,
                 c_noise,
                 text_encoder_conds,
                 batch,
@@ -272,11 +303,23 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 prior_x0 = edm_playground.x0_target_from_model_output(prior_noisy, prior_output, prior_sigma)
                 target[diff_output_pr_indices] = prior_x0.to(target.dtype)
 
-        return pred_x0, target, c_noise, None
+        weighting = None
+        loss_weighting = getattr(args, "pgv25_loss_weighting", edm_playground.LOSS_WEIGHTING_NONE) or edm_playground.LOSS_WEIGHTING_NONE
+        if loss_weighting == edm_playground.LOSS_WEIGHTING_EDM:
+            # Per-sample λ(σ). process_batch multiplies the unreduced x0 MSE by this,
+            # which is the F-space loss. Default remains unweighted (None).
+            weighting = edm_playground.edm_loss_weight(sigma).to(device=latents.device, dtype=torch.float32).view(-1, 1, 1, 1)
+        elif loss_weighting != edm_playground.LOSS_WEIGHTING_NONE:
+            raise ValueError(
+                f"--pgv25_loss_weighting={loss_weighting} is not supported. "
+                f"Use {edm_playground.LOSS_WEIGHTING_NONE} or {edm_playground.LOSS_WEIGHTING_EDM}."
+            )
+        return pred_x0, target, c_noise, weighting
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if getattr(args, "playground_v25", False):
-            # Unweighted x0 MSE. Min-SNR and v-pred weightings are rejected in validate_training_args.
+            # Min-SNR and v-pred weightings are rejected in validate_training_args.
+            # Optional EDM λ is applied earlier as the per-sample loss weight.
             return loss
         return super().post_process_loss(loss, args, timesteps, noise_scheduler)
 
@@ -307,6 +350,15 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
 
     def update_metadata(self, metadata, args):
         metadata["ss_playground_v25"] = bool(getattr(args, "playground_v25", False))
+        if getattr(args, "playground_v25", False):
+            metadata["ss_pgv25_sigma_sampling"] = getattr(
+                args, "pgv25_sigma_sampling", edm_playground.SIGMA_SAMPLING_KARRAS
+            )
+            metadata["ss_pgv25_loss_weighting"] = getattr(
+                args, "pgv25_loss_weighting", edm_playground.LOSS_WEIGHTING_NONE
+            )
+            metadata["ss_pgv25_sigma_mean"] = getattr(args, "pgv25_sigma_mean", edm_playground.DEFAULT_P_MEAN)
+            metadata["ss_pgv25_sigma_std"] = getattr(args, "pgv25_sigma_std", edm_playground.DEFAULT_P_STD)
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         if getattr(args, "playground_v25", False):

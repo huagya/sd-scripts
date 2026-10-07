@@ -1,7 +1,10 @@
 """Playground v2.5 EDM math, guards, latent-cache identity, and the unchanged SDXL path."""
 
 import argparse
+import math
 import os
+import subprocess
+import sys
 from contextlib import nullcontext
 
 import numpy as np
@@ -247,11 +250,24 @@ def test_latent_cache_is_not_mixed_with_sdxl(tmp_path):
     assert loaded.shape == (4, 8, 16)
     assert np.allclose(loaded, latents.numpy())
 
-    # An SDXL-looking file renamed into the Playground suffix is refused.
+    # An SDXL-looking file renamed into the Playground suffix is incomplete: recompute, do not crash the run.
     bad = tmp_path / "other_0128x0064_pgv25.npz"
     np.savez(bad, latents_8x16=latents.numpy(), original_size_8x16=np.array([64, 128]), crop_ltrb_8x16=np.array([0, 0, 0, 0]))
-    with pytest.raises(ValueError, match="latent_format"):
+    assert pg.is_disk_cached_latents_expected((128, 64), str(bad), False, False) is False
+    with pytest.raises(ValueError, match="Delete this file"):
         pg.load_latents_from_disk(str(bad), (128, 64))
+    # A foreign format string is a one-line error that names the file.
+    foreign = tmp_path / "img_08_0128x0064_pgv25.npz"
+    np.savez(
+        foreign,
+        latents_8x16=latents.numpy(),
+        original_size_8x16=np.array([64, 128]),
+        crop_ltrb_8x16=np.array([0, 0, 0, 0]),
+        latent_format=np.array("sdxl_raw"),
+        source_basename=np.array("img_08"),
+    )
+    with pytest.raises(ValueError, match="img_08_0128x0064_pgv25.npz"):
+        pg.is_disk_cached_latents_expected((128, 64), str(foreign), False, False)
 
     copied = tmp_path / "img_99_0128x0064_pgv25.npz"
     with np.load(pg_path) as src:
@@ -269,9 +285,11 @@ class _Accel:
 
 
 class _FakeUnet(torch.nn.Module):
+    """Depends on the latent and the timestep, so a constant-output UNet cannot pass."""
+
     def forward(self, x, timesteps, context, y):
-        bias = context.float().mean() + y.float().mean() + timesteps.float().mean()
-        return x.float() * 0.0 + bias
+        t = timesteps.float().view(-1, 1, 1, 1)
+        return x.float() * 0.05 + t * 0.01
 
 
 def test_sdxl_noise_target_path_is_unchanged():
@@ -314,8 +332,8 @@ def test_sdxl_noise_target_path_is_unchanged():
     assert weighting is None
     assert torch.equal(target, reference_noise)
     assert torch.equal(timesteps, reference_timesteps)
-    # Fake UNet returns a constant, so this only checks the call happened on the DDPM noisy latent.
-    assert pred.shape == reference_noisy.shape
+    expected_pred = reference_noisy.float() * 0.05 + reference_timesteps.float().view(-1, 1, 1, 1) * 0.01
+    assert torch.allclose(pred.float(), expected_pred, rtol=1e-5, atol=1e-5)
     scaled = trainer.shift_scale_latents(args, torch.ones(1, 4, 2, 2))
     assert torch.allclose(scaled, torch.full_like(scaled, sdxl_model_util.VAE_SCALE_FACTOR))
 
@@ -336,6 +354,13 @@ def test_trainer_playground_target_is_x0_not_epsilon():
     }
     text = [torch.zeros(2, 77, 32), torch.zeros(2, 77, 32), torch.zeros(2, 1280)]
     torch.manual_seed(11)
+    noise = torch.randn_like(latents, dtype=torch.float32)
+    indices = torch.randint(0, edm_playground.NUM_TRAIN_TIMESTEPS, (latents.shape[0],), device="cpu")
+    noisy, scaled, c_noise_ref, sigma = edm_playground.prepare_edm_inputs(latents, noise, indices)
+    model_out = scaled.float() * 0.05 + c_noise_ref.float().view(-1, 1, 1, 1) * 0.01
+    expected = edm_playground.x0_target_from_model_output(noisy, model_out, sigma)
+
+    torch.manual_seed(11)
     pred, target, c_noise, weighting = trainer.get_noise_pred_and_target(
         args,
         _Accel(),
@@ -351,11 +376,12 @@ def test_trainer_playground_target_is_x0_not_epsilon():
     )
     assert weighting is None
     assert torch.allclose(target, latents.float())
-    # c_noise is log-sigma, not a DDPM integer timestep.
     assert c_noise.dtype == torch.float32
-    assert int(c_noise.abs().max()) < 1000 or True
+    assert torch.allclose(c_noise, 0.25 * torch.log(sigma))
+    assert torch.allclose(c_noise, c_noise_ref)
+    assert int(c_noise.abs().max()) < 1000
     assert not torch.allclose(c_noise, c_noise.round())
-    assert pred.shape == latents.shape
+    assert torch.allclose(pred, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_sample_images_are_skipped(monkeypatch):
@@ -368,3 +394,184 @@ def test_sample_images_are_skipped(monkeypatch):
     monkeypatch.setattr(sdxl_train_util, "sample_images", explode)
     trainer.sample_images(None, args, 0, 1, "cpu", None, None, None, None)
     trainer.sample_images(None, args, 0, 2, "cpu", None, None, None, None)
+
+
+def _pg_batch(batch_size=2):
+    return {
+        "original_sizes_hw": torch.tensor([[64, 64]] * batch_size),
+        "crop_top_lefts": torch.tensor([[0, 0]] * batch_size),
+        "target_sizes_hw": torch.tensor([[64, 64]] * batch_size),
+    }
+
+
+def _pg_text(batch_size=2):
+    return [torch.zeros(batch_size, 77, 32), torch.zeros(batch_size, 77, 32), torch.zeros(batch_size, 1280)]
+
+
+def test_validation_pins_karras_index(monkeypatch):
+    real_randint = torch.randint
+
+    def fail_randint(*_a, **_k):
+        raise AssertionError("validation sampled a random sigma")
+
+    monkeypatch.setattr(torch, "randint", fail_randint)
+    trainer = sdxl_train_network.SdxlNetworkTrainer()
+    args = _base_args(no_half_vae=True, min_timestep=200, max_timestep=200)
+    latents = torch.randn(2, 4, 4, 4)
+    _pred, _target, c_noise, weighting = trainer.get_noise_pred_and_target(
+        args, _Accel(), None, latents, _pg_batch(), _pg_text(), _FakeUnet(), None, torch.float32, True, False
+    )
+    expected = edm_playground.get_schedule().timesteps[200].expand_as(c_noise)
+    assert torch.allclose(c_noise, expected)
+    assert weighting is None
+    # Training still draws even if the validation hack left min == max on the args object.
+    called = {"n": 0}
+
+    def counting_randint(*a, **k):
+        called["n"] += 1
+        return real_randint(*a, **k)
+
+    monkeypatch.setattr(torch, "randint", counting_randint)
+    trainer.get_noise_pred_and_target(
+        args, _Accel(), None, latents, _pg_batch(), _pg_text(), _FakeUnet(), None, torch.float32, True, True
+    )
+    assert called["n"] == 1
+
+
+def test_continuous_sigma_c_noise_is_quarter_log():
+    sigma = torch.tensor([0.123456, 3.5, 17.0], dtype=torch.float32)
+    latents = torch.randn(3, 4, 2, 2)
+    noise = torch.randn_like(latents)
+    _noisy, _scaled, c_noise, sigma_out = edm_playground.prepare_edm_inputs_from_sigma(latents, noise, sigma)
+    assert torch.allclose(sigma_out, sigma)
+    assert torch.allclose(c_noise, 0.25 * torch.log(sigma), rtol=0, atol=0)
+    schedule = edm_playground.get_schedule()
+    for value, cn in zip(sigma, c_noise):
+        nearest = int(torch.argmin((schedule.sigmas[:-1] - value).abs()).item())
+        assert abs(float(cn) - float(schedule.timesteps[nearest])) > 1e-4
+
+
+def test_lognormal_sigma_stats():
+    torch.manual_seed(0)
+    sigma = edm_playground.sample_lognormal_sigma(100_000, p_mean=-1.2, p_std=1.2)
+    log_sigma = torch.log(sigma)
+    assert float(log_sigma.mean()) == pytest.approx(-1.2, abs=0.02)
+    assert float(log_sigma.std(unbiased=False)) == pytest.approx(1.2, abs=0.02)
+    assert float(sigma.median()) == pytest.approx(math.exp(-1.2), rel=0.05)
+    assert float((sigma > 10).float().mean()) < 0.02
+
+
+def test_edm_weight_matches_f_space_mse():
+    torch.manual_seed(3)
+    latents = torch.randn(4, 4, 4, 4)
+    noise = torch.randn_like(latents)
+    indices = torch.tensor([0, 10, 400, 999])
+    noisy, scaled, c_noise, sigma = edm_playground.prepare_edm_inputs(latents, noise, indices)
+    model_out = torch.sin(scaled) * 0.1 + c_noise.view(-1, 1, 1, 1) * 0.01
+    pred = edm_playground.x0_target_from_model_output(noisy, model_out, sigma)
+    weight = edm_playground.edm_loss_weight(sigma).view(-1, 1, 1, 1)
+    weighted = ((pred - latents) ** 2 * weight).mean()
+    c_out = edm_playground.c_out(sigma.view(-1, 1, 1, 1))
+    f_target = (latents - edm_playground.c_skip(sigma.view(-1, 1, 1, 1)) * noisy) / c_out
+    f_space = ((model_out - f_target) ** 2).mean()
+    unweighted = ((pred - latents) ** 2).mean()
+    assert torch.allclose(weighted, f_space, rtol=1e-5, atol=1e-5)
+    assert not torch.allclose(unweighted, f_space, rtol=1e-3, atol=1e-3)
+
+
+def test_trainer_lognormal_and_edm_weight(monkeypatch):
+    def fail_randint(*_a, **_k):
+        raise AssertionError("lognormal sampling should not draw a Karras index")
+
+    monkeypatch.setattr(torch, "randint", fail_randint)
+    trainer = sdxl_train_network.SdxlNetworkTrainer()
+    args = _base_args(no_half_vae=True, pgv25_sigma_sampling="lognormal", pgv25_loss_weighting="edm")
+    latents = torch.randn(2, 4, 4, 4)
+    _pred, target, c_noise, weighting = trainer.get_noise_pred_and_target(
+        args, _Accel(), None, latents, _pg_batch(), _pg_text(), _FakeUnet(), None, torch.float32, True, True
+    )
+    sigma = torch.exp(c_noise / 0.25)
+    assert torch.allclose(c_noise, 0.25 * torch.log(sigma))
+    assert torch.allclose(weighting, edm_playground.edm_loss_weight(sigma).view(-1, 1, 1, 1))
+    assert torch.allclose(target, latents.float())
+
+
+@pytest.mark.parametrize("train_unet", [False, True])
+def test_gradient_checkpoint_bf16_does_not_raise(train_unet):
+    trainer = sdxl_train_network.SdxlNetworkTrainer()
+    args = _base_args(no_half_vae=True, gradient_checkpointing=True)
+    latents = torch.randn(2, 4, 2, 2)
+    pred, target, c_noise, weighting = trainer.get_noise_pred_and_target(
+        args,
+        _Accel(),
+        None,
+        latents,
+        _pg_batch(),
+        _pg_text(),
+        _FakeUnet(),
+        None,
+        torch.bfloat16,
+        train_unet,
+        True,
+    )
+    assert pred.shape == latents.shape
+    assert target.shape == latents.shape
+    assert c_noise.shape == (2,)
+    assert weighting is None
+
+
+def test_pg_options_require_the_flag():
+    args = _base_args(playground_v25=False, pgv25_loss_weighting="edm")
+    with pytest.raises(ValueError, match="require --playground_v25"):
+        sdxl_train_util.verify_sdxl_training_args(args, support_playground_v25=True)
+
+
+def test_incomplete_cache_and_size_change(tmp_path):
+    image = tmp_path / "img_01.png"
+    image.write_bytes(b"aaaa")
+    pg = PlaygroundV25LatentsCachingStrategy(True, 1, False)
+    path = pg.get_latents_npz_path(str(image), (64, 64))
+    latents = torch.arange(4 * 8 * 8, dtype=torch.float32).reshape(4, 8, 8)
+    pg._stamp_by_npz = None
+    pg.save_latents_to_disk(path, latents, [64, 64], [0, 0, 64, 64], key_reso_suffix="_8x8")
+    assert pg.is_disk_cached_latents_expected((64, 64), path, False, False) is True
+    loaded, _, _, _, _ = pg.load_latents_from_disk(path, (64, 64))
+    assert np.allclose(loaded, latents.numpy())
+    with np.load(path) as npz:
+        assert "source_size" in npz.files
+        assert "source_mtime_ns" in npz.files
+    assert [name for name in os.listdir(tmp_path) if name.startswith(".pgv25-cache-")] == []
+
+    image.write_bytes(b"aaaa-replaced")
+    assert pg.is_disk_cached_latents_expected((64, 64), path, False, False) is False
+
+    garbage = tmp_path / "img_02_0064x0064_pgv25.npz"
+    garbage.write_bytes(b"not a numpy archive")
+    pg.get_latents_npz_path(str(tmp_path / "img_02.png"), (64, 64))
+    skip = PlaygroundV25LatentsCachingStrategy(True, 1, True)
+    skip.get_latents_npz_path(str(tmp_path / "img_02.png"), (64, 64))
+    assert skip.is_disk_cached_latents_expected((64, 64), str(garbage), False, False) is False
+
+    fp16 = PlaygroundV25LatentsCachingStrategy(True, 1, False)
+    fp16.cache_fp16 = True
+    fp16_path = fp16.get_latents_npz_path(str(image), (64, 64))
+    fp16._stamp_by_npz = None
+    fp16.save_latents_to_disk(fp16_path, latents, [64, 64], [0, 0, 64, 64], key_reso_suffix="_8x8")
+    with np.load(fp16_path) as npz:
+        assert npz["latents_8x8"].dtype == np.float16
+    loaded_fp16, _, _, _, _ = fp16.load_latents_from_disk(fp16_path, (64, 64))
+    assert np.allclose(loaded_fp16.astype(np.float32), latents.numpy())
+
+
+def test_weight_check_script_skips_when_missing(tmp_path):
+    missing = tmp_path / "missing-playground.safetensors"
+    proc = subprocess.run(
+        [sys.executable, "tools/check_playground_v25_unet.py", "--model", str(missing)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    combined = proc.stdout + proc.stderr
+    assert "SKIP" in combined
+    assert str(missing) in combined

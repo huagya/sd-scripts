@@ -194,9 +194,11 @@ class PlaygroundV25LatentsCachingStrategy(SdSdxlLatentsCachingStrategy):
     """Raw VAE latents for Playground v2.5, in ``*_pgv25.npz`` files.
 
     Normalization ``(z - mean) * 0.5 / std`` is applied at train time, not in
-    the cache. The file records ``latent_format=playground_v25_raw`` and the
-    source image stem. SDXL ``*_sdxl.npz`` / legacy ``.npz`` files are never
-    selected, and a mismatched Playground file raises instead of being reused.
+    the cache. The file records ``latent_format=playground_v25_raw``, the
+    source image stem, and the source file size and mtime. SDXL ``*_sdxl.npz``
+    / legacy ``.npz`` files are never selected. An incomplete cache is
+    recomputed. A file whose format or source stem does not match raises one
+    line that names the file. Writes are a temp file plus ``os.replace``.
     """
 
     def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
@@ -205,34 +207,97 @@ class PlaygroundV25LatentsCachingStrategy(SdSdxlLatentsCachingStrategy):
 
         self.suffix = PGV25_NPZ_SUFFIX
         self._stamp_by_npz: Optional[dict] = None
+        self._image_path_by_npz: dict = {}
+        self._image_stat_by_npz: dict = {}
+        # Off by default. fp16 only stores the raw VAE sample; train time still normalizes in fp32.
+        self.cache_fp16 = False
 
     def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
         # Do not fall back to legacy .npz or *_sdxl.npz. Those are a different normalization.
-        return os.path.splitext(absolute_path)[0] + f"_{image_size[0]:04d}x{image_size[1]:04d}" + self.suffix
+        path = os.path.splitext(absolute_path)[0] + f"_{image_size[0]:04d}x{image_size[1]:04d}" + self.suffix
+        self._image_path_by_npz[path] = absolute_path
+        return path
 
-    def _assert_cache_file(self, npz_path: str) -> None:
-        from library.edm_playground import assert_playground_latent_npz
+    def _image_path_for(self, npz_path: str) -> Optional[str]:
+        return self._image_path_by_npz.get(npz_path)
+
+    def _classify(self, npz_path: str) -> str:
+        """``missing``, ``ok``, or ``recompute``. May raise one line for a bad identity."""
+        from library.edm_playground import classify_playground_cache
 
         if not os.path.exists(npz_path):
-            return
-        with np.load(npz_path) as npz:
-            assert_playground_latent_npz(npz_path, npz)
+            return "missing"
+        image_path = self._image_path_for(npz_path)
+        try:
+            loaded = np.load(npz_path)
+        except Exception as ex:
+            # Includes a truncated zip and numpy's "pickled data" ValueError.
+            # A format/source ValueError is raised later, after the file opens.
+            logger.warning(
+                "playground_v25: cannot read %s (%s). It will be recomputed. Delete this file if you meant to keep it.",
+                npz_path,
+                ex,
+            )
+            return "recompute"
+        with loaded as npz:
+            return classify_playground_cache(npz_path, npz, image_path)
 
     def is_disk_cached_latents_expected(self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool):
-        # Format/source checks are never skipped, including with --skip_cache_check.
-        self._assert_cache_file(npz_path)
+        # Format, source stem, and size/mtime are never skipped, including with --skip_cache_check.
+        status = self._classify(npz_path)
+        if status != "ok":
+            return False
+        if self.skip_disk_cache_validity_check:
+            return True
         return self._default_is_disk_cached_latents_expected(8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True)
 
     def load_latents_from_disk(
         self, npz_path: str, bucket_reso: Tuple[int, int]
     ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
-        self._assert_cache_file(npz_path)
-        return self._default_load_latents_from_disk(8, npz_path, bucket_reso)
+        status = self._classify(npz_path)
+        if status != "ok":
+            raise ValueError(
+                f"Latent cache {npz_path} is incomplete or does not match its image. "
+                "Delete this file and rerun so training rebuilds it."
+            )
+        # Read and close the archive. Leaving np.load open locks the file on Windows.
+        expected_latents_size = (bucket_reso[1] // 8, bucket_reso[0] // 8)  # bucket_reso is (W, H)
+        key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"
+        with np.load(npz_path) as npz:
+            if "latents" + key_reso_suffix not in npz:
+                if "latents" not in npz:
+                    raise ValueError(
+                        f"latents not found in {npz_path} (with or without resolution suffix {key_reso_suffix}). "
+                        "Delete this file and rerun so training rebuilds it."
+                    )
+                key_reso_suffix = ""
+            latents = npz["latents" + key_reso_suffix]
+            original_size = npz["original_size" + key_reso_suffix].tolist()
+            crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()
+            flipped_key = "latents_flipped" + key_reso_suffix
+            alpha_key = "alpha_mask" + key_reso_suffix
+            flipped_latents = npz[flipped_key] if flipped_key in npz else None
+            alpha_mask = npz[alpha_key] if alpha_key in npz else None
+            # Copy out of the zip before it closes.
+            latents = np.array(latents)
+            if flipped_latents is not None:
+                flipped_latents = np.array(flipped_latents)
+            if alpha_mask is not None:
+                alpha_mask = np.array(alpha_mask)
+        return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
 
     def cache_batch_latents(self, vae, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool):
-        from library.edm_playground import STAMP_ENV
+        from library.edm_playground import STAMP_ENV, image_file_stat
 
         self._stamp_by_npz = {}
+        self._image_stat_by_npz = {}
+        for info in image_infos:
+            if getattr(info, "latents_npz", None) and getattr(info, "absolute_path", None):
+                self._image_path_by_npz[info.latents_npz] = info.absolute_path
+                try:
+                    self._image_stat_by_npz[info.latents_npz] = image_file_stat(info.absolute_path)
+                except OSError as ex:
+                    logger.warning("playground_v25: could not stat %s (%s)", info.absolute_path, ex)
         if os.environ.get(STAMP_ENV) == "1":
             from PIL import Image
 
@@ -246,6 +311,12 @@ class PlaygroundV25LatentsCachingStrategy(SdSdxlLatentsCachingStrategy):
         finally:
             self._stamp_by_npz = None
 
+    def _store_latent_array(self, latents_tensor):
+        array = latents_tensor.float().cpu().numpy()
+        if self.cache_fp16:
+            array = array.astype(np.float16)
+        return array
+
     def save_latents_to_disk(
         self,
         npz_path,
@@ -256,7 +327,15 @@ class PlaygroundV25LatentsCachingStrategy(SdSdxlLatentsCachingStrategy):
         alpha_mask=None,
         key_reso_suffix="",
     ):
-        from library.edm_playground import LATENT_FORMAT_KEY, LATENT_FORMAT_VALUE, LATENT_SOURCE_KEY, npz_source_basename
+        from library.edm_playground import (
+            LATENT_FORMAT_KEY,
+            LATENT_FORMAT_VALUE,
+            LATENT_SOURCE_KEY,
+            LATENT_SOURCE_MTIME_NS_KEY,
+            LATENT_SOURCE_SIZE_KEY,
+            atomic_savez,
+            npz_source_basename,
+        )
 
         if self._stamp_by_npz and npz_path in self._stamp_by_npz:
             stamp = self._stamp_by_npz[npz_path]
@@ -265,17 +344,39 @@ class PlaygroundV25LatentsCachingStrategy(SdSdxlLatentsCachingStrategy):
             if flipped_latents_tensor is not None:
                 flipped_latents_tensor = flipped_latents_tensor.clone()
                 flipped_latents_tensor[0, 0, 0] = stamp
-        super().save_latents_to_disk(
-            npz_path,
-            latents_tensor,
-            original_size,
-            crop_ltrb,
-            flipped_latents_tensor,
-            alpha_mask,
-            key_reso_suffix,
-        )
-        with np.load(npz_path) as npz:
-            kwargs = {key: npz[key] for key in npz.files}
+
+        kwargs = {}
+        if os.path.exists(npz_path):
+            # Keep other resolutions already stored in a valid cache. An incomplete file is replaced.
+            try:
+                if self._classify(npz_path) == "ok":
+                    with np.load(npz_path) as npz:
+                        kwargs = {key: npz[key] for key in npz.files}
+            except ValueError:
+                kwargs = {}
+            except Exception:
+                kwargs = {}
+
+        kwargs["latents" + key_reso_suffix] = self._store_latent_array(latents_tensor)
+        kwargs["original_size" + key_reso_suffix] = np.array(original_size)
+        kwargs["crop_ltrb" + key_reso_suffix] = np.array(crop_ltrb)
+        if flipped_latents_tensor is not None:
+            kwargs["latents_flipped" + key_reso_suffix] = self._store_latent_array(flipped_latents_tensor)
+        if alpha_mask is not None:
+            kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
         kwargs[LATENT_FORMAT_KEY] = np.array(LATENT_FORMAT_VALUE)
         kwargs[LATENT_SOURCE_KEY] = np.array(npz_source_basename(npz_path))
-        np.savez(npz_path, **kwargs)
+        stat = self._image_stat_by_npz.get(npz_path)
+        if stat is None:
+            image_path = self._image_path_for(npz_path)
+            if image_path and os.path.isfile(image_path):
+                from library.edm_playground import image_file_stat
+
+                try:
+                    stat = image_file_stat(image_path)
+                except OSError:
+                    stat = None
+        if stat is not None:
+            kwargs[LATENT_SOURCE_SIZE_KEY] = np.int64(stat[0])
+            kwargs[LATENT_SOURCE_MTIME_NS_KEY] = np.int64(stat[1])
+        atomic_savez(npz_path, **kwargs)
